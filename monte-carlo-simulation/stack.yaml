@@ -1,0 +1,617 @@
+---
+Description: "Creates the stack for running a Monte Carlo Simulation."
+AWSTemplateFormatVersion: '2010-09-09'
+
+##############################################################
+#
+# PARAMETERS
+#
+##############################################################
+Parameters:
+  Prefix:
+    Type: String
+    Default: mcs
+    Description: This prefix will be prepended to all resource names.
+
+##############################################################
+#
+# RESOURCES
+#
+##############################################################
+Resources:
+  ##############################################################
+  #
+  # SECURITY ROLES
+  #
+  ##############################################################
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Join [ '-', [ !Ref Prefix, 'lambda-role', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Description: Role for Monte Carlo Lambda functions.
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyName: !Join [ '-', [ !Ref Prefix, 'lambda-s3-policy', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 's3:*'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'lambda-role', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  StepFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Join [ '-', [ !Ref Prefix, 'step-function-role', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Description: Role for Monte Carlo step functions.
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+        Version: '2012-10-17'
+      Policies:
+        - PolicyName: !Join [ '-', [ !Ref Prefix, 'step-function-lambda-policy', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+        - PolicyName: !Join [ '-', [ !Ref Prefix, 'step-function-s3-policy', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 's3:*'
+                Resource: '*'
+        - PolicyName: !Join [ '-', [ !Ref Prefix, 'step-function-dmap-policy', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                  - 'states:DescribeExecution'
+                  - 'states:StopExecution'
+                Resource: '*'
+
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'step-function-role', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  ##############################################################
+  #
+  # S3 BUCKETS
+  #
+  ##############################################################
+  SourceS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join [ '-', [ !Ref Prefix, 'source', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'source', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  DestinationS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join [ '-', [ !Ref Prefix, 'destination', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'destination', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  ##############################################################
+  #
+  # LAMBDA FUNCTIONS
+  #
+  ##############################################################
+  DataGenLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join [ '-', [ !Ref Prefix, 'data-gen', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Description: Generates data in S3 source bucket for Monte Carlo simulation.
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import random
+          from enum import Enum
+          
+          import boto3
+          
+          COLUMNS = ['num_doors', 'strategy']
+          
+          
+          class GameStrategy(Enum):
+              STICK = 'stick'
+              SWITCH = 'switch'
+          
+          
+          # noinspection PyUnusedLocal
+          def lambda_handler(event, context):
+              source_bucket = event['source']['bucket']
+              prefix = event['source']['prefix']
+              iterations = int(event['simulation']['iterations'])
+              num_doors = int(event['simulation']['num_doors'])
+          
+              header = ','.join(COLUMNS)
+              s3 = boto3.resource('s3')
+          
+              for i in range(iterations):
+                  file_name = prefix + str(i + 1).zfill(6) + '.csv'
+                  strategy = random.choice(list(GameStrategy))
+                  line = f'{num_doors},{strategy.value}'
+          
+                  # Create one row per file.
+                  s3.Object(source_bucket, file_name).put(Body=header + '\n' + line)
+
+
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'data-gen', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  DataDeleteLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join [ '-', [ !Ref Prefix, 'data-delete', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Description: Deletes all data in S3 buckets from Monte Carlo simulation.
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          
+          
+          # noinspection PyUnusedLocal
+          def lambda_handler(event, context):
+              source_bucket = event['source']['bucket']
+              destination_bucket = event['destination']['bucket']
+          
+              buckets = [source_bucket, destination_bucket]
+          
+              s3 = boto3.client('s3')
+          
+              for bucket in buckets:
+                  print(f'Cleaning bucket {bucket}...')
+          
+                  paginator = s3.get_paginator('list_objects_v2')
+                  pages = paginator.paginate(Bucket=bucket)
+          
+                  for page in pages:
+                      contents = page.get('Contents')
+          
+                      if contents is None:
+                          print('Bucket is empty.')
+                          break
+          
+                      for obj in contents:
+                          key = obj['Key']
+                          s3.delete_object(Bucket=bucket, Key=key)
+          
+                  print(f'Finished cleaning bucket {bucket}.')
+
+
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'data-delete', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  PredictiveModelLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join [ '-', [ !Ref Prefix, 'predictive-model', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Description: Runs the main predictive model of our Monte Carlo simulation.
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import csv
+          import io
+          import random
+          from enum import Enum
+          from typing import Union
+          
+          import boto3
+          
+          NUM_DOORS_DEFAULT = 3
+          WINNING_PRIZE = 'car'
+          LOSING_PRIZE = 'goat'
+          
+          s3_client = boto3.client("s3")
+          
+          
+          class GameStrategy(Enum):
+              STICK = 'stick'
+              SWITCH = 'switch'
+          
+          
+          class GameResult(Enum):
+              LOST = 'lost'
+              WON = 'won'
+          
+          
+          def get_csv_dict_from_string(csv_string: str):
+              return csv.DictReader(io.StringIO(csv_string))
+          
+          
+          def get_file_from_s3(input_bucket_name: str, key: str) -> str:
+              resp = s3_client.get_object(Bucket=input_bucket_name, Key=key)
+              return resp["Body"].read().decode("utf-8")
+          
+          
+          def play_game(strategy: Union[GameStrategy, str], num_doors: int = NUM_DOORS_DEFAULT) -> str:
+              """
+              Play a single iteration of the Monte Hall problem.
+              :param strategy: The player can choose to stick with or switch from their initial choice.
+              :param num_doors: The number of doors in the game. The default is 3.
+              :return: Returns a value indicating whether the player won or lost.
+              """
+          
+              if not isinstance(strategy, GameStrategy):
+                  strategy = GameStrategy(strategy)
+          
+              # Create all doors with goat.
+              doors = [LOSING_PRIZE] * num_doors
+          
+              # Randomly replace with a car behind one of the doors.
+              doors[random.randint(0, num_doors - 1)] = WINNING_PRIZE
+              print(f'Doors: {doors}')
+          
+              # Play the game!
+          
+              # 1. Player picks a door, but it is not opened.
+              player_choice = random.randint(0, num_doors - 1)
+              print(f'Player chooses door #{player_choice}')
+          
+              # 2. Host will now select one of the other doors having a goat. Door is then opened.
+              host_choices = [index for index, prize in enumerate(doors) if index != player_choice and prize != WINNING_PRIZE]
+              print(f'Hosts choices: {host_choices}')
+          
+              host_choice = random.choice(host_choices)
+              print(f'Host opens door #{host_choice} ({doors[host_choice]})')
+          
+              # 3. Player now decides if they want to change their first choice.
+              if strategy == GameStrategy.SWITCH:
+                  print('Player switches door choice.')
+          
+                  # Player is only allowed to choose the door not yet chosen.
+                  player_choice = [i for i, prize in enumerate(doors) if i != player_choice and i != host_choice][0]
+          
+              print(f'Player\'s final door choice #{player_choice}')
+          
+              result = GameResult.WON if doors[player_choice] == WINNING_PRIZE else GameResult.LOST
+              print(f'Player {result.value}!')
+          
+              return result.value
+          
+          
+          # noinspection PyUnusedLocal
+          def lambda_handler(event, context):
+              batch_input = event['BatchInput']
+              source_bucket = batch_input['source']['bucket']
+          
+              items = event['Items']
+          
+              results = []
+          
+              for item in items:
+                  csv_data = get_file_from_s3(source_bucket, item["Key"])
+                  dict_data = get_csv_dict_from_string(csv_data)
+          
+                  for row in dict_data:
+                      num_doors = int(row['num_doors'])
+                      strategy = row['strategy']
+          
+                      result = play_game(strategy, num_doors)
+          
+                      results.append({
+                          "num_doors": num_doors,
+                          "strategy": strategy,
+                          "result": result
+                      })
+          
+              return results
+
+
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'predictive-model', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  ParseResultsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Join [ '-', [ !Ref Prefix, 'parse-results', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      Description: Parses the DMap results of our Monte Carlo simulation and saves them to a single file.
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 60
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          
+          import boto3
+          
+          PREFIX = 'SUCCEEDED_'
+          RESULTS_FILE = 'results.csv'
+          
+          s3_client = boto3.client('s3')
+          
+          
+          def get_file_from_s3(bucket_name: str, key: str) -> str:
+              resp = s3_client.get_object(Bucket=bucket_name, Key=key)
+              return resp['Body'].read().decode('utf-8')
+          
+          
+          def write_file_to_s3(bucket_name: str, key: str, contents: str) -> None:
+              s3_client.put_object(Bucket=bucket_name, Key=key, Body=contents)
+          
+          
+          # noinspection PyUnusedLocal
+          def lambda_handler(event, context):
+              bucket = event['ResultWriterDetails']['Bucket']
+              manifest_key = event['ResultWriterDetails']['Key']
+          
+              # Get path to all 'success' files.
+              path = manifest_key.replace('manifest.json', '')
+              path += PREFIX
+          
+              paginator = s3_client.get_paginator('list_objects_v2')
+          
+              operation_parameters = {
+                  'Bucket': bucket,
+                  'Prefix': path
+              }
+          
+              pages = paginator.paginate(**operation_parameters)
+              results = []
+          
+              for page in pages:
+                  contents = page.get('Contents')
+          
+                  if contents is None:
+                      print('Results file(s) not found.')
+                      break
+          
+                  for obj in contents:
+                      dmap_data = get_file_from_s3(bucket, obj['Key'])
+                      dmap_batches = json.loads(dmap_data)
+          
+                      for batch in dmap_batches:
+                          output = batch['Output']
+                          output_dict = json.loads(output)
+          
+                          for output_row in output_dict:
+                              num_doors = output_row['num_doors']
+                              strategy = output_row['strategy']
+                              result = output_row['result']
+          
+                              results.append([num_doors, strategy, result])
+          
+              contents = 'num_doors,strategy,result'
+          
+              for row in results:
+                  contents += '\n' + ','.join(map(str, row))
+          
+              write_file_to_s3(bucket, RESULTS_FILE, contents)
+          
+              return results
+
+
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'parse-results', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  ##############################################################
+  #
+  # STEP FUNCTIONS
+  #
+  ##############################################################
+  MonteCarloSimulationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Join [ '-', [ !Ref Prefix, 'monte-carlo-pipeline', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Perform a distributed Monte Carlo Simulation.",
+          "StartAt": "SetParameters",
+          "States": {
+            "SetParameters": {
+              "Type": "Pass",
+              "Next": "CleanBuckets",
+              "Result": {
+                "source": {
+                  "bucket": "${SourceS3Bucket}",
+                  "prefix": "input-"
+                },
+                "destination": {
+                  "bucket": "${DestinationS3Bucket}",
+                  "path": "results"
+                },
+                "simulation": {
+                  "iterations": 100,
+                  "num_doors": 3
+                }
+              }
+            },
+            "CleanBuckets": {
+              "Comment": "Deletes all content from source and destination buckets.",
+              "Type": "Task",
+              "Next": "GenerateData",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DataDeleteLambdaFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "ResultPath": null
+            },
+            "GenerateData": {
+              "Comment": "Generates files with random data for simulations.",
+              "Type": "Task",
+              "Next": "MapData",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DataGenLambdaFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "ResultPath": null
+            },
+            "MapData": {
+              "Type": "Map",
+              "Next": "ParseResults",
+              "MaxConcurrency": 100,
+              "Label": "MapData",
+              "ItemReader": {
+                "Resource": "arn:aws:states:::s3:listObjectsV2",
+                "Parameters": {
+                  "Bucket": "${SourceS3Bucket}",
+                  "Prefix.$": "$.source.prefix"
+                }
+              },
+              "ItemBatcher": {
+                "MaxItemsPerBatch": 10,
+                "BatchInput": {
+                  "source.$": "$.source",
+                  "simulation.$": "$.simulation"
+                }
+              },
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "DISTRIBUTED",
+                  "ExecutionType": "STANDARD"
+                },
+                "StartAt": "ProcessData",
+                "States": {
+                  "ProcessData": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${PredictiveModelLambdaFunction.Arn}",
+                      "Payload.$": "$"
+                    },
+                    "OutputPath": "$.Payload",
+                    "End": true
+                  }
+                }
+              },
+              "ResultWriter": {
+                "Resource": "arn:aws:states:::s3:putObject",
+                "Parameters": {
+                  "Bucket.$": "$.destination.bucket",
+                  "Prefix.$": "$.destination.path"
+                }
+              }
+            },
+            "ParseResults": {
+              "Comment": "Combines all results data into a single file.",
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ParseResultsLambdaFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'monte-carlo-pipeline', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+  MonteCarloDeleteDataStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Join [ '-', [ !Ref Prefix, 'monte-carlo-delete-data-pipeline', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Deletes all generated data from our Monte Carlo Simulation.",
+          "StartAt": "SetParameters",
+          "States": {
+            "SetParameters": {
+              "Type": "Pass",
+              "Next": "CleanBuckets",
+              "Result": {
+                "source": {
+                  "bucket": "${SourceS3Bucket}",
+                  "prefix": "input-"
+                },
+                "destination": {
+                  "bucket": "${DestinationS3Bucket}",
+                  "path": "results"
+                }
+              }
+            },
+            "CleanBuckets": {
+              "Comment": "Deletes all content from source and destination buckets.",
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${DataDeleteLambdaFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "End": true
+            }
+          }
+        }
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, 'monte-carlo-delete-data-pipeline', !Select [ 7, !Split [ '-', !Ref AWS::StackId ] ] ] ]
+
+##############################################################
+#
+# OUTPUTS
+#
+##############################################################
+Outputs:
+  StackId:
+    Value:
+      Ref: AWS::StackId
+
+  SourceS3BucketName:
+    Value:
+      Ref: SourceS3Bucket
+
+  DestinationS3BucketName:
+    Value:
+      Ref: DestinationS3Bucket
+
+  DataGenLambdaFunctionName:
+    Value:
+      Ref: DataGenLambdaFunction
+
+  DataDeleteLambdaFunctionName:
+    Value:
+      Ref: DataDeleteLambdaFunction
+
+  PredictiveModelLambdaFunctionName:
+    Value:
+      Ref: PredictiveModelLambdaFunction
+
+  ParseResultsLambdaFunctionName:
+    Value:
+      Ref: ParseResultsLambdaFunction
